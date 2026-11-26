@@ -129,7 +129,7 @@ typedef struct {
 } Record;
 _Static_assert(sizeof(Record) == 544, "Record must match the layout src/native_shader_spirv.c reads");
 typedef struct { VkDeviceAddress records; } Push;
-typedef struct { uint64_t address; uint32_t width, height, swap, tiling; int is_float; Image image; } Target;
+typedef struct { uint64_t address; uint32_t width, height, swap, tiling; int is_float; uint64_t post_frame; Image image; } Target;
 /* source: the descriptor it was made from; span: the bytes of game memory it reads; hash: of
  * that memory when last uploaded (the game reuses memory for new content, see textures_check);
  * used: the last frame that drew with it or uploaded into it (see texture_slot). */
@@ -1053,10 +1053,14 @@ static uint32_t stream_code(uint32_t format, uint32_t number) {
 }
 
 /* ---- Replaying a frame ---- */
-/* RenoDX HDR: may this draw's pixel shader go above 1 (see the record flag in draw)? vw.ini:
- * hdr_clamp=0 never clamps, 1 (default) lets additive draws and passes reading a float target
- * through, 2 clamps every shader; hdr_allow_ps / hdr_deny_ps (hex hashes, comma separated) are
- * always let through / always clamped, read at start. */
+/* RenoDX HDR: may this draw's pixel shader go above 1 (see the record flag in draw)? A pass that
+ * reads a float target carries the scene's HDR on and may; it also marks its target "post" for
+ * this frame, and later draws into a post target that read no float target (the interface and
+ * its overlays) stay clamped. Otherwise vw.ini decides, read at start:
+ *   hdr_clamp=0  every other shader may go above 1;
+ *   hdr_clamp=1  (default) additive draws (blend destination factor one) and hdr_allow_ps may;
+ *   hdr_clamp=2  none may;
+ *   hdr_allow_ps / hdr_deny_ps: hex hashes, comma separated; deny wins over everything. */
 #define HDR_LIST 64
 static uint32_t hdr_allow[HDR_LIST], hdr_deny[HDR_LIST], hdr_allow_n, hdr_deny_n;
 static int hdr_clamp_mode = -1;
@@ -1086,15 +1090,16 @@ static int hdr_unclamped(uint32_t ps_hash) {
         printf("Native: HDR clamp mode %d\n", hdr_clamp_mode);
     }
     if (hdr_in(hdr_deny, hdr_deny_n, ps_hash)) return 0;
-    if (hdr_in(hdr_allow, hdr_allow_n, ps_hash)) return 1;
-    if (hdr_clamp_mode == 0) return 1;
-    if (hdr_clamp_mode == 2) return 0;
-    if (((state.blend >> 30) & 1) && ((state.blend >> 8) & 0x1f) == 1) return 1;
     for (int i = 0; i < TEXTURE_SLOTS; ++i)
         if (state.texture_present[i] && state.texture_index[i] != state.target->image.index &&
-            image_is_float[state.texture_index[i]])
+            image_is_float[state.texture_index[i]]) {
+            state.target->post_frame = frame_number;
             return 1;
-    return 0;
+        }
+    if (state.target->post_frame == frame_number) return 0;   /* interface over the composed scene */
+    if (hdr_clamp_mode == 2) return 0;
+    if (hdr_clamp_mode == 0 || hdr_in(hdr_allow, hdr_allow_n, ps_hash)) return 1;
+    return ((state.blend >> 30) & 1) && ((state.blend >> 8) & 0x1f) == 1;
 }
 static void draw(const uint8_t *payload) {
     const NativeDraw *d = (const NativeDraw *)payload;
