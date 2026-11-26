@@ -1053,6 +1053,49 @@ static uint32_t stream_code(uint32_t format, uint32_t number) {
 }
 
 /* ---- Replaying a frame ---- */
+/* RenoDX HDR: may this draw's pixel shader go above 1 (see the record flag in draw)? vw.ini:
+ * hdr_clamp=0 never clamps, 1 (default) lets additive draws and passes reading a float target
+ * through, 2 clamps every shader; hdr_allow_ps / hdr_deny_ps (hex hashes, comma separated) are
+ * always let through / always clamped, read at start. */
+#define HDR_LIST 64
+static uint32_t hdr_allow[HDR_LIST], hdr_deny[HDR_LIST], hdr_allow_n, hdr_deny_n;
+static int hdr_clamp_mode = -1;
+static void hdr_list_read(const char *key, uint32_t *list, uint32_t *n) {
+    char text[1024];
+    *n = 0;
+    if (!vwgpu_setting_text(key, text, sizeof(text))) return;
+    for (char *at = text; *at && *n < HDR_LIST;) {
+        char *end;
+        const unsigned long v = strtoul(at, &end, 16);
+        if (end == at) { ++at; continue; }
+        list[(*n)++] = (uint32_t)v;
+        at = end;
+    }
+    printf("Native: %s has %u shaders\n", key, *n);
+}
+static int hdr_in(const uint32_t *list, uint32_t n, uint32_t hash) {
+    for (uint32_t i = 0; i < n; ++i) if (list[i] == hash) return 1;
+    return 0;
+}
+static int hdr_unclamped(uint32_t ps_hash) {
+    if (hdr_clamp_mode < 0) {
+        char text[16];
+        hdr_clamp_mode = vwgpu_setting_text("hdr_clamp", text, sizeof(text)) ? atoi(text) : 1;
+        hdr_list_read("hdr_allow_ps", hdr_allow, &hdr_allow_n);
+        hdr_list_read("hdr_deny_ps", hdr_deny, &hdr_deny_n);
+        printf("Native: HDR clamp mode %d\n", hdr_clamp_mode);
+    }
+    if (hdr_in(hdr_deny, hdr_deny_n, ps_hash)) return 0;
+    if (hdr_in(hdr_allow, hdr_allow_n, ps_hash)) return 1;
+    if (hdr_clamp_mode == 0) return 1;
+    if (hdr_clamp_mode == 2) return 0;
+    if (((state.blend >> 30) & 1) && ((state.blend >> 8) & 0x1f) == 1) return 1;
+    for (int i = 0; i < TEXTURE_SLOTS; ++i)
+        if (state.texture_present[i] && state.texture_index[i] != state.target->image.index &&
+            image_is_float[state.texture_index[i]])
+            return 1;
+    return 0;
+}
 static void draw(const uint8_t *payload) {
     const NativeDraw *d = (const NativeDraw *)payload;
     const NativeStream *streams = (const NativeStream *)(d + 1);
@@ -1149,13 +1192,7 @@ static void draw(const uint8_t *payload) {
      * that add light (blend destination factor one) or that read a float target (passes carrying
      * the scene's HDR on, up to the display buffer). The game's other draws wrote garbage above 1
      * (battle map stripes). */
-    if (state.target->is_float) {
-        int hdr = ((state.blend >> 30) & 1) && ((state.blend >> 8) & 0x1f) == 1;
-        for (int i = 0; i < TEXTURE_SLOTS && !hdr; ++i)
-            hdr = state.texture_present[i] && state.texture_index[i] != state.target->image.index &&
-                  image_is_float[state.texture_index[i]];
-        if (hdr) record->slot[0] |= 0x80000000u;
-    }
+    if (state.target->is_float && hdr_unclamped(programs[ps].hash)) record->slot[0] |= 0x80000000u;
     /* Every game constant slot of both stages: the shaders read theirs by slot. */
     for (int stage = 0; stage < 2; ++stage)
         for (int i = 0; i < GAME_SLOTS; ++i)

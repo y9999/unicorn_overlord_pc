@@ -26,7 +26,8 @@ std::mutex text_mutex;
 std::map<std::string, std::string> texts; // key_map, pad_map, button_icons
 // Keys this build does not know (the other renderer's settings): written back unchanged.
 std::map<std::string, std::string> extras;
-constexpr const char* TextKeys[] = {"key_map", "pad_map", "button_icons"};
+// hdr_*_ps: RenoDX HDR pixel shader lists (src/native_vk.c), hex hashes separated by commas.
+constexpr const char* TextKeys[] = {"key_map", "pad_map", "button_icons", "hdr_allow_ps", "hdr_deny_ps", "hdr_clamp"};
 
 void Set(Values& v, const std::string& key, const std::string& value) {
     for (const char* text_key : TextKeys) {
