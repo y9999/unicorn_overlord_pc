@@ -1419,8 +1419,9 @@ static void once_end(void) {
     CHECK(vkWaitForFences(device, 1, &once_fence, VK_TRUE, UINT64_MAX));
     CHECK(vkResetFences(device, 1, &once_fence));
 }
-static void shot(const Target *target) {
-    const char *dir = getenv("VW_NATIVE_DUMP_DIR");
+static void shot_to(const Target *target, const char *dir);
+static void shot(const Target *target) { shot_to(target, getenv("VW_NATIVE_DUMP_DIR")); }
+static void shot_to(const Target *target, const char *dir) {
     char path[4096];
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -1566,6 +1567,40 @@ static void render_frame(NativeList *lists) {
         ++reports;
     }
     report = 0;
+    /* RenoDX HDR diagnosis: when <data>/hdr_report.trigger exists, it is removed and this frame's
+     * command lists go to <data>/logs/hdr_report_<frame>.txt with a table of the targets, and
+     * every target of 1280 pixels or wider is written as a PNG beside it (float ones clamped). */
+    {
+        static char report_trigger[2048], report_dir[2048];
+        if (!report_trigger[0]) {
+            const char *data = getenv("VW_DATA_DIR");
+            snprintf(report_trigger, sizeof(report_trigger), "%s/hdr_report.trigger", data && *data ? data : ".");
+            snprintf(report_dir, sizeof(report_dir), "%s/logs", data && *data ? data : ".");
+        }
+        FILE *f = fopen(report_trigger, "r");
+        if (f) {
+            fclose(f);
+            remove(report_trigger);
+            CHECK(vkWaitForFences(device, 1, &frame->fence, VK_TRUE, UINT64_MAX));
+            char path[4200];
+            snprintf(path, sizeof(path), "%s/hdr_report_%06" PRIu64 ".txt", report_dir, frame_number);
+            native_dump_frame(lists, path);
+            FILE *out = fopen(path, "a");
+            if (out) {
+                fprintf(out, "== targets (display %" PRIx64 ")\n", state.display ? state.display->address : 0);
+                for (uint32_t i = 0; i < target_count; ++i)
+                    if (targets[i].address != ~0ull)
+                        fprintf(out, "target %" PRIx64 " %ux%u tiling %u swap %u %s index %u\n", targets[i].address,
+                                targets[i].width, targets[i].height, targets[i].tiling, targets[i].swap,
+                                targets[i].is_float ? "RGBA16F" : "RGBA8", targets[i].image.index);
+                fclose(out);
+            }
+            for (uint32_t i = 0; i < target_count; ++i)
+                if (targets[i].address != ~0ull && targets[i].width >= 1280) shot_to(&targets[i], report_dir);
+            printf("Native: HDR report written to %s\n", path);
+            fflush(stdout);
+        }
+    }
     const char *trigger = getenv("VW_NATIVE_SHOT_TRIGGER");
     if (trigger && *trigger) {
         FILE *f = fopen(trigger, "r");
