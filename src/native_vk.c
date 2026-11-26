@@ -129,7 +129,7 @@ typedef struct {
 } Record;
 _Static_assert(sizeof(Record) == 544, "Record must match the layout src/native_shader_spirv.c reads");
 typedef struct { VkDeviceAddress records; } Push;
-typedef struct { uint64_t address; uint32_t width, height, swap, tiling; Image image; } Target;
+typedef struct { uint64_t address; uint32_t width, height, swap, tiling; int is_float; Image image; } Target;
 /* source: the descriptor it was made from; span: the bytes of game memory it reads; hash: of
  * that memory when last uploaded (the game reuses memory for new content, see textures_check);
  * used: the last frame that drew with it or uploaded into it (see texture_slot). */
@@ -137,7 +137,7 @@ typedef struct {
     uint64_t address; uint32_t width, height, format, number, tiling; uint8_t swizzle[4]; Image image;
     GnmTexture source; size_t span; uint64_t hash, used;
 } Texture;
-typedef struct { uint32_t vs, ps, blend, mask, topology; VkPipeline pipeline; } Pipeline;
+typedef struct { uint32_t vs, ps, blend, mask, topology, is_float; VkPipeline pipeline; } Pipeline;
 
 static VkInstance instance;
 static VkPhysicalDevice physical;
@@ -275,9 +275,12 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags flags) {
     fprintf(stderr, "Native: no memory type for %x\n", (unsigned)flags);
     abort();
 }
-/* RenoDX HDR (vw.ini hdr_output=1 with hdr_float=1, read once at start): the game's render
- * targets are 16-bit float instead of 8-bit UNORM, so blends and effects above SDR white are kept
- * for the presenter's HDR10 output instead of clipped at 1.0, and gradients do not band. */
+/* RenoDX HDR (vw.ini hdr_output=1 with hdr_float=1, read once at start): the game's full-size
+ * scene targets and the display buffer are 16-bit float instead of 8-bit UNORM, so blends and
+ * effects above SDR white are kept for the presenter's HDR10 output instead of clipped at 1.0,
+ * and gradients do not band. The small targets stay RGBA8: the game composes its characters and
+ * effects there as data (masks, gradient-map indices) that relies on the UNORM clamp; in float
+ * they came out as checkerboards and false colours. */
 static int float_targets(void) {
     static int value = -1;
     if (value < 0) {
@@ -286,10 +289,21 @@ static int float_targets(void) {
     }
     return value;
 }
-static VkFormat target_format(void) {
-    return float_targets() ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+/* A float target: the display buffer (tiling 10) and targets at least VW_HDR_FLOAT_MIN_WIDTH
+ * (default 2560) by 1440*that/2560 pixels: the scene at a 1800p or 4K render resolution. */
+static int target_wants_float(uint32_t width, uint32_t height, uint32_t tiling) {
+    if (!float_targets()) return 0;
+    if (tiling == 10) return 1;
+    static uint32_t min_width;
+    if (!min_width) {
+        const char *env = getenv("VW_HDR_FLOAT_MIN_WIDTH");
+        min_width = env && atoi(env) > 0 ? (uint32_t)atoi(env) : 2560u;
+    }
+    return width >= min_width && height * 2560u >= min_width * 1440u;
 }
-static uint32_t target_bytes(void) { return float_targets() ? 8u : 4u; }
+static VkFormat format_of(int is_float) {
+    return is_float ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+}
 /* One half float to a byte as an UNORM target stores it (clamped to 0..1, rounded). */
 static uint8_t half_to_unorm8(uint16_t h) {
     const uint32_t sign = h >> 15, exponent = (h >> 10) & 0x1f, mantissa = h & 0x3ff;
@@ -299,8 +313,8 @@ static uint8_t half_to_unorm8(uint16_t h) {
     return value >= 1.0f ? 255 : (uint8_t)(value * 255.0f + 0.5f);
 }
 /* Rows of a read back target to 8 bits per channel in place (no-op for RGBA8 targets). */
-static void readback_to_unorm8(uint8_t *data, size_t pixels) {
-    if (!float_targets()) return;
+static void readback_to_unorm8(uint8_t *data, size_t pixels, int is_float) {
+    if (!is_float) return;
     const uint16_t *in = (const uint16_t *)data;
     for (size_t i = 0; i < pixels * 4; ++i) data[i] = half_to_unorm8(in[i]);
 }
@@ -535,10 +549,11 @@ static Target *target_get(const GnmTarget *t) {
     map_set(&target_map, t->address, target_count);
     target->address = t->address; target->width = t->width; target->height = t->height;
     target->swap = t->swap; target->tiling = t->tiling;
+    target->is_float = target_wants_float(t->width, t->height, t->tiling);
     if (getenv("VW_NATIVE_LOG_TARGETS"))
         printf("Native: target %ux%u tiling %u at %" PRIx64 " (frame %" PRIu64 ")\n", t->width, t->height, t->tiling,
                t->address, frame_number);
-    target->image = image_create(t->width, t->height, target_format(),
+    target->image = image_create(t->width, t->height, format_of(target->is_float),
                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, NULL);
     to_general(target->image.image, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -846,12 +861,13 @@ static VkBlendOp blend_op(uint32_t f) {
 }
 static VkPipeline pipeline_create(int vs, int ps, VkPrimitiveTopology topology);
 static VkPipeline pipeline_build(VkShaderModule vs, VkShaderModule ps, uint32_t blend, uint32_t mask,
-                                 VkPrimitiveTopology topology);
+                                 VkPrimitiveTopology topology, int is_float);
 /* The pipeline for the draw's shaders and state; the last one is kept, as runs of draws share it. */
 static VkPipeline pipeline_get(int vs, int ps, VkPrimitiveTopology topology) {
-    static uint32_t last[5];
+    static uint32_t last[6];
     static VkPipeline last_pipeline;
-    const uint32_t key[5] = {(uint32_t)vs, (uint32_t)ps, state.blend, state.mask, (uint32_t)topology};
+    const uint32_t key[6] = {(uint32_t)vs, (uint32_t)ps, state.blend, state.mask, (uint32_t)topology,
+                             (uint32_t)(state.target && state.target->is_float)};
     if (last_pipeline && !memcmp(key, last, sizeof(key))) return last_pipeline;
     memcpy(last, key, sizeof(key));
     return last_pipeline = pipeline_create(vs, ps, topology);
@@ -859,14 +875,15 @@ static VkPipeline pipeline_get(int vs, int ps, VkPrimitiveTopology topology) {
 static VkPipeline pipeline_create(int vs, int ps, VkPrimitiveTopology topology) {
     /* FNV-1a over the key; collisions are resolved by comparing the stored key. */
     uint64_t key = 0xcbf29ce484222325ull;
-    const uint32_t words[5] = {(uint32_t)vs, (uint32_t)ps, state.blend, state.mask, (uint32_t)topology};
-    for (int i = 0; i < 5; ++i) key = (key ^ words[i]) * 0x100000001b3ull;
+    const uint32_t is_float = (uint32_t)(state.target && state.target->is_float);
+    const uint32_t words[6] = {(uint32_t)vs, (uint32_t)ps, state.blend, state.mask, (uint32_t)topology, is_float};
+    for (int i = 0; i < 6; ++i) key = (key ^ words[i]) * 0x100000001b3ull;
     for (uint32_t probe = 0;; ++probe) {
         const uint32_t i = map_get(&pipeline_map, key + probe);
         if (!i) { key += probe; break; }
         const Pipeline *p = &pipelines[i - 1];
         if (p->vs == (uint32_t)vs && p->ps == (uint32_t)ps && p->blend == state.blend && p->mask == state.mask &&
-            p->topology == (uint32_t)topology)
+            p->topology == (uint32_t)topology && p->is_float == is_float)
             return p->pipeline;
     }
     if (pipeline_count == MAX_PIPELINES) { fprintf(stderr, "Native: more than %d pipelines\n", MAX_PIPELINES); abort(); }
@@ -874,9 +891,10 @@ static VkPipeline pipeline_create(int vs, int ps, VkPrimitiveTopology topology) 
     memset(p, 0, sizeof(*p));
     p->vs = (uint32_t)vs; p->ps = (uint32_t)ps; p->blend = state.blend; p->mask = state.mask;
     p->topology = (uint32_t)topology;
+    p->is_float = is_float;
     map_set(&pipeline_map, key, pipeline_count);
     const uint64_t compile_start = clock_ns();
-    p->pipeline = pipeline_build(programs[vs].module, programs[ps].module, state.blend, state.mask, topology);
+    p->pipeline = pipeline_build(programs[vs].module, programs[ps].module, state.blend, state.mask, topology, (int)is_float);
     const double compile_ms = (double)(clock_ns() - compile_start) / 1e6;
     /* VW_NATIVE_PIPELINE_LOG=1: each pipeline made during play and its compile time (what the
      * list compiled at start, src/native_pipelines.h, still misses). */
@@ -891,7 +909,7 @@ static VkPipeline pipeline_create(int vs, int ps, VkPrimitiveTopology topology) 
 }
 /* A pipeline for the converted shaders with the game's blend state and write mask. Any thread. */
 static VkPipeline pipeline_build(VkShaderModule vs, VkShaderModule ps, uint32_t b, uint32_t mask,
-                                 VkPrimitiveTopology topology) {
+                                 VkPrimitiveTopology topology, int is_float) {
     const VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vs, .pName = "main"},
@@ -921,7 +939,7 @@ static VkPipeline pipeline_build(VkShaderModule vs, VkShaderModule ps, uint32_t 
     const VkDynamicState dynamics[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     const VkPipelineDynamicStateCreateInfo dynamic = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .dynamicStateCount = 2, .pDynamicStates = dynamics};
-    const VkFormat color_format = target_format();
+    const VkFormat color_format = format_of(is_float);
     const VkPipelineRenderingCreateInfo rendering = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1, .pColorAttachmentFormats = &color_format};
     const VkPipelineDepthStencilStateCreateInfo depth = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -980,7 +998,7 @@ static void *pipeline_warm_thread(void *unused) {
             }
         }
         if (!m[0] || !m[1]) continue;
-        vkDestroyPipeline(device, pipeline_build(m[0], m[1], k.blend, k.mask, (VkPrimitiveTopology)k.topology), NULL);
+        vkDestroyPipeline(device, pipeline_build(m[0], m[1], k.blend, k.mask, (VkPrimitiveTopology)k.topology, 0), NULL);
         ++built;
     }
     for (uint32_t j = 0; j < loaded; ++j) vkDestroyShaderModule(device, modules[j], NULL);
@@ -1318,11 +1336,11 @@ static void present_copy(const Target *display) {
         const VkFormat formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
         const VkImageFormatListCreateInfo list = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
                                                   .viewFormatCount = 2, .pViewFormats = formats};
-        /* Float targets: the presenter samples one float view (no sRGB view) and decodes itself. */
-        const int is_float = float_targets();
+        /* Float display: the presenter samples one float view (no sRGB view) and decodes itself. */
+        const int is_float = display->is_float;
         const VkImageCreateInfo info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = is_float ? NULL : &list,
             .flags = is_float ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, .imageType = VK_IMAGE_TYPE_2D,
-            .format = target_format(),
+            .format = format_of(is_float),
             .extent = {display->width, display->height, 1}, .mipLevels = 1, .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
@@ -1407,14 +1425,14 @@ static void shot(const Target *target) {
     VkBuffer buffer;
     VkDeviceMemory memory;
     uint8_t *mapped;
-    const VkDeviceSize size = (VkDeviceSize)target->width * target->height * target_bytes();
+    const VkDeviceSize size = (VkDeviceSize)target->width * target->height * (target->is_float ? 8u : 4u);
     buffer_create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped);
     once_begin();
     const VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                     .imageExtent = {target->width, target->height, 1}};
     vkCmdCopyImageToBuffer(cmd, target->image.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
     once_end();
-    readback_to_unorm8(mapped, (size_t)target->width * target->height);
+    readback_to_unorm8(mapped, (size_t)target->width * target->height, target->is_float);
     snprintf(path, sizeof(path), "%s/native_shot_%06" PRIu64 "_%" PRIx64 ".png", dir && *dir ? dir : ".", frame_number,
              target->address);
     if (getenv("VW_NATIVE_SHOT_ALPHA"))   /* debugging aid: the image's alpha as grey */
@@ -1452,7 +1470,7 @@ int native_target_read(uint64_t address, void *out, uint32_t left, uint32_t top,
         return 0;
     }
     if (read_address != address || read_frame != frame_number) {
-        const VkDeviceSize size = (VkDeviceSize)t->width * t->height * target_bytes();
+        const VkDeviceSize size = (VkDeviceSize)t->width * t->height * (t->is_float ? 8u : 4u);
         if (size > capacity) {
             if (buffer) { vkDestroyBuffer(device, buffer, NULL); vkFreeMemory(device, memory, NULL); }
             buffer_create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped);
@@ -1466,7 +1484,7 @@ int native_target_read(uint64_t address, void *out, uint32_t left, uint32_t top,
         vkCmdCopyImageToBuffer(cmd, t->image.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
         once_end();
         cmd = saved;
-        readback_to_unorm8(mapped, (size_t)t->width * t->height);
+        readback_to_unorm8(mapped, (size_t)t->width * t->height, t->is_float);
         read_address = address, read_frame = frame_number;
         static int told;
         if (!told++) printf("Native: the game reads render target %" PRIx64 " (%ux%u) back\n", address, t->width, t->height);
