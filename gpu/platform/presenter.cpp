@@ -27,6 +27,7 @@
 #include "vw_graphics.h"
 #include "vw_overlay.h"
 #include "vw_settings.h"
+#include "../vwgpu.h"
 
 #define A_CPU
 #include "shaders/ffx_a.h"
@@ -37,7 +38,10 @@ namespace {
 
 constexpr u32 InFlight = 2;
 // The frame image is BGRA whatever the swapchain uses: frame dumps (tools/uo_raw2png.py) read BGRA.
-constexpr VkFormat FrameFormat = VK_FORMAT_B8G8R8A8_UNORM;
+// RenoDX HDR: with an HDR10 swapchain it is 10-bit (PQ encoded by the present pass) instead.
+VkFormat FrameFormat = VK_FORMAT_B8G8R8A8_UNORM;
+// The native renderer's images are RGBA16F (RenoDX HDR float targets), read through a float view.
+bool float_input = false;
 constexpr VkFormat PassFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr VkImageSubresourceRange Color{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
@@ -401,6 +405,11 @@ public:
     struct Settings {
         u32 srgb_input;
         float sharpen;
+        u32 hdr_output;      // 1: the frame is HDR10 (PQ, BT.2020)
+        u32 hdr_mode;        // 0 vanilla, 1 HDR, 2 highlights shown in magenta
+        float peak_nits;
+        float game_nits;
+        u32 gamma22;         // decode SDR values with gamma 2.2 (else the sRGB curve)
     };
 
     void Create() {
@@ -530,7 +539,20 @@ struct Swapchain {
         std::vector<VkSurfaceFormatKHR> formats(count);
         vkGetPhysicalDeviceSurfaceFormatsKHR(vk.physical, vk.surface, &count, formats.data());
         format = {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+        VwSettings::Get().hdr_active = false;
         if (count && formats[0].format == VK_FORMAT_UNDEFINED) return;
+        if (VwSettings::Get().startup_hdr_output) {
+            for (const auto& f : formats) {
+                if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+                    (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
+                    format = f;
+                    VwSettings::Get().hdr_active = true;
+                    std::printf("Swapchain: HDR10 (RenoDX HDR)\n");
+                    return;
+                }
+            }
+            std::printf("Swapchain: HDR10 asked for, but the display offers none: SDR (turn on HDR in Windows)\n");
+        }
         for (const auto& f : formats)
             if (f.format == VK_FORMAT_R8G8B8A8_UNORM || f.format == VK_FORMAT_B8G8R8A8_UNORM) {
                 format = f;
@@ -668,6 +690,7 @@ VkExtent2D FrameSize(VkExtent2D target) {
 }
 
 VkImageView NativeView(VkImage image, bool srgb) {
+    if (float_input) srgb = false;
     const u64 key = reinterpret_cast<u64>(image) ^ u64(srgb);
     VkImageView& view = native_views[key];
     if (!view) {
@@ -675,7 +698,9 @@ VkImageView NativeView(VkImage image, bool srgb) {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = image,
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+            .format = float_input ? VK_FORMAT_R16G16B16A16_SFLOAT
+                      : srgb      ? VK_FORMAT_R8G8B8A8_SRGB
+                                  : VK_FORMAT_R8G8B8A8_UNORM,
             // Alpha is excluded from the output.
             .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                            VK_COMPONENT_SWIZZLE_ONE},
@@ -687,7 +712,8 @@ VkImageView NativeView(VkImage image, bool srgb) {
 
 /// Records the passes from the game's image into `frame`.
 void DrawFrame(VkCommandBuffer cmd, VkImage image, u32 width, u32 height, DisplayFormat format) {
-    const bool srgb = format == DisplayFormat::Srgb;
+    // Float images have no sRGB view: their sRGB values are decoded in the present pass.
+    const bool srgb = format == DisplayFormat::Srgb && !float_input;
     VkImageView view = NativeView(image, srgb);
     VkExtent2D size{width, height};
     game_ratio = float(width) / float(height);
@@ -712,9 +738,15 @@ void DrawFrame(VkCommandBuffer cmd, VkImage image, u32 width, u32 height, Displa
     // A larger image is averaged down in the present pass, which also sharpens it (CAS) when
     // sharpening is on: RCAS only runs at the same size or above.
     const bool downscaling = size.width > frame.width || size.height > frame.height;
+    const bool encoded = format == DisplayFormat::Srgb10 || (float_input && format == DisplayFormat::Srgb);
     PresentPass::Settings settings{
-        .srgb_input = format == DisplayFormat::Srgb10 ? 1u : 0u,
-        .sharpen = downscaling && rcas ? float(VwGraphics::ParseRcasStrength(s.rcas_strength)) / 100.0f : 0.0f};
+        .srgb_input = encoded ? 1u : 0u,
+        .sharpen = downscaling && rcas ? float(VwGraphics::ParseRcasStrength(s.rcas_strength)) / 100.0f : 0.0f,
+        .hdr_output = s.hdr_active ? 1u : 0u,
+        .hdr_mode = u32(std::clamp(s.hdr_mode.load(), 0, 2)),
+        .peak_nits = float(std::clamp(s.hdr_peak_nits.load(), VwSettings::HdrPeakMin, VwSettings::HdrPeakMax)),
+        .game_nits = float(std::clamp(s.hdr_game_nits.load(), VwSettings::HdrGameMin, VwSettings::HdrGameMax)),
+        .gamma22 = s.hdr_gamma22 ? 1u : 0u};
     if (settings.sharpen > 0.0f) s.rcas_applied = true;
     view = fsr.Render(cmd, view, size, {frame.width, frame.height}, fsr1, rcas,
                       VwGraphics::RcasAttenuation(s.rcas_strength));
@@ -876,6 +908,8 @@ void PresenterInit() {
     PushDescriptorSet = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
         vkGetDeviceProcAddr(vk.device, "vkCmdPushDescriptorSetKHR"));
     swapchain.ChooseFormat();
+    if (VwSettings::Get().hdr_active) FrameFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    float_input = vwgpu_hdr_float_targets() != 0;
     swapchain.ChooseMode();
     swapchain.Create(u32(std::max(window->GetWidth(), 1)), u32(std::max(window->GetHeight(), 1)));
     const VkCommandPoolCreateInfo pool_info{.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,

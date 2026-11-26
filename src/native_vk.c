@@ -275,6 +275,35 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags flags) {
     fprintf(stderr, "Native: no memory type for %x\n", (unsigned)flags);
     abort();
 }
+/* RenoDX HDR (vw.ini hdr_output=1 with hdr_float=1, read once at start): the game's render
+ * targets are 16-bit float instead of 8-bit UNORM, so blends and effects above SDR white are kept
+ * for the presenter's HDR10 output instead of clipped at 1.0, and gradients do not band. */
+static int float_targets(void) {
+    static int value = -1;
+    if (value < 0) {
+        value = vwgpu_hdr_float_targets() ? 1 : 0;
+        printf("Native: render targets %s\n", value ? "RGBA16F (RenoDX HDR)" : "RGBA8");
+    }
+    return value;
+}
+static VkFormat target_format(void) {
+    return float_targets() ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+}
+static uint32_t target_bytes(void) { return float_targets() ? 8u : 4u; }
+/* One half float to a byte as an UNORM target stores it (clamped to 0..1, rounded). */
+static uint8_t half_to_unorm8(uint16_t h) {
+    const uint32_t sign = h >> 15, exponent = (h >> 10) & 0x1f, mantissa = h & 0x3ff;
+    if (sign || exponent == 0) return 0;   /* negative, zero or tiny */
+    if (exponent == 31) return mantissa ? 0 : 255;
+    const float value = (1.0f + (float)mantissa / 1024.0f) * (float)(1u << exponent) / 32768.0f;
+    return value >= 1.0f ? 255 : (uint8_t)(value * 255.0f + 0.5f);
+}
+/* Rows of a read back target to 8 bits per channel in place (no-op for RGBA8 targets). */
+static void readback_to_unorm8(uint8_t *data, size_t pixels) {
+    if (!float_targets()) return;
+    const uint16_t *in = (const uint16_t *)data;
+    for (size_t i = 0; i < pixels * 4; ++i) data[i] = half_to_unorm8(in[i]);
+}
 static Image image_create(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, const uint8_t *swizzle) {
     Image image;
     const VkImageCreateInfo info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
@@ -509,7 +538,7 @@ static Target *target_get(const GnmTarget *t) {
     if (getenv("VW_NATIVE_LOG_TARGETS"))
         printf("Native: target %ux%u tiling %u at %" PRIx64 " (frame %" PRIu64 ")\n", t->width, t->height, t->tiling,
                t->address, frame_number);
-    target->image = image_create(t->width, t->height, VK_FORMAT_R8G8B8A8_UNORM,
+    target->image = image_create(t->width, t->height, target_format(),
                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, NULL);
     to_general(target->image.image, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -892,7 +921,7 @@ static VkPipeline pipeline_build(VkShaderModule vs, VkShaderModule ps, uint32_t 
     const VkDynamicState dynamics[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     const VkPipelineDynamicStateCreateInfo dynamic = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .dynamicStateCount = 2, .pDynamicStates = dynamics};
-    const VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat color_format = target_format();
     const VkPipelineRenderingCreateInfo rendering = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1, .pColorAttachmentFormats = &color_format};
     const VkPipelineDepthStencilStateCreateInfo depth = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -1289,8 +1318,11 @@ static void present_copy(const Target *display) {
         const VkFormat formats[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
         const VkImageFormatListCreateInfo list = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
                                                   .viewFormatCount = 2, .pViewFormats = formats};
-        const VkImageCreateInfo info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &list,
-            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        /* Float targets: the presenter samples one float view (no sRGB view) and decodes itself. */
+        const int is_float = float_targets();
+        const VkImageCreateInfo info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = is_float ? NULL : &list,
+            .flags = is_float ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, .imageType = VK_IMAGE_TYPE_2D,
+            .format = target_format(),
             .extent = {display->width, display->height, 1}, .mipLevels = 1, .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
@@ -1375,13 +1407,14 @@ static void shot(const Target *target) {
     VkBuffer buffer;
     VkDeviceMemory memory;
     uint8_t *mapped;
-    const VkDeviceSize size = (VkDeviceSize)target->width * target->height * 4;
+    const VkDeviceSize size = (VkDeviceSize)target->width * target->height * target_bytes();
     buffer_create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped);
     once_begin();
     const VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                     .imageExtent = {target->width, target->height, 1}};
     vkCmdCopyImageToBuffer(cmd, target->image.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
     once_end();
+    readback_to_unorm8(mapped, (size_t)target->width * target->height);
     snprintf(path, sizeof(path), "%s/native_shot_%06" PRIu64 "_%" PRIx64 ".png", dir && *dir ? dir : ".", frame_number,
              target->address);
     if (getenv("VW_NATIVE_SHOT_ALPHA"))   /* debugging aid: the image's alpha as grey */
@@ -1419,7 +1452,7 @@ int native_target_read(uint64_t address, void *out, uint32_t left, uint32_t top,
         return 0;
     }
     if (read_address != address || read_frame != frame_number) {
-        const VkDeviceSize size = (VkDeviceSize)t->width * t->height * 4;
+        const VkDeviceSize size = (VkDeviceSize)t->width * t->height * target_bytes();
         if (size > capacity) {
             if (buffer) { vkDestroyBuffer(device, buffer, NULL); vkFreeMemory(device, memory, NULL); }
             buffer_create(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped);
@@ -1433,6 +1466,7 @@ int native_target_read(uint64_t address, void *out, uint32_t left, uint32_t top,
         vkCmdCopyImageToBuffer(cmd, t->image.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
         once_end();
         cmd = saved;
+        readback_to_unorm8(mapped, (size_t)t->width * t->height);
         read_address = address, read_frame = frame_number;
         static int told;
         if (!told++) printf("Native: the game reads render target %" PRIx64 " (%ux%u) back\n", address, t->width, t->height);

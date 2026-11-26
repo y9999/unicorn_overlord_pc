@@ -57,6 +57,19 @@ bool CreateVulkan(Frontend::WindowSDL& w) {
         return false;
     }
     std::vector<const char*> extensions(sdl_extensions, sdl_extensions + extension_count);
+    {
+        // RenoDX HDR: the HDR10 (ST 2084) swapchain colour space needs this instance extension.
+        u32 count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> all(count);
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, all.data());
+        for (const auto& e : all) {
+            if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+                extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                break;
+            }
+        }
+    }
     std::vector<const char*> layers;
     if (const char* v = std::getenv("VW_VK_VALIDATION"); v && *v == '1') {
         layers.push_back("VK_LAYER_KHRONOS_validation");

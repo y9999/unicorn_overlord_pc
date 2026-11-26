@@ -308,6 +308,34 @@ void ImageTab() {
         ImGui::EndDisabled();
         ImGui::EndTable();
     }
+    // RenoDX HDR (presenter.cpp, present.frag; float targets in src/native_vk.c).
+    ImGui::SeparatorText("HDR (RenoDX)");
+    if (BeginRows("##hdr")) {
+        CheckRow("HDR10 output", s.hdr_output,
+                 "Shows the game in HDR10 (needs HDR on in Windows). Applied after Apply and restart.");
+        ImGui::BeginDisabled(!s.hdr_output);
+        CheckRow("16-bit render targets", s.hdr_float,
+                 "Renders the game in 16-bit float: light, magic and fire keep what lies above SDR white, and "
+                 "gradients no longer band. Off: 8-bit as on a PS4. Applied after Apply and restart.");
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(!s.hdr_active);
+        static const char* const modes[3] = {"Vanilla (SDR look)", "HDR", "Show highlights"};
+        ChoiceRow("Tone mapping", s.hdr_mode, modes, nullptr, 3,
+                  "Vanilla: the SDR image, clipped at SDR white. HDR: highlights rise to the peak brightness. "
+                  "Show highlights: what lies above SDR white in magenta (none means no HDR data there).");
+        SliderRow("Peak brightness", s.hdr_peak_nits, VwSettings::HdrPeakMin, VwSettings::HdrPeakMax, "%d nits",
+                  "Your display's peak brightness.");
+        SliderRow("Game brightness", s.hdr_game_nits, VwSettings::HdrGameMin, VwSettings::HdrGameMax, "%d nits",
+                  "The brightness of SDR white: the game's art, text and menus. 203 is the HDR reference.");
+        CheckRow("Gamma 2.2", s.hdr_gamma22,
+                 "Decodes the game's SDR colours as an SDR monitor shows them (gamma 2.2). Off: the sRGB curve, "
+                 "lighter shadows.");
+        ImGui::EndDisabled();
+        InfoRow("Status", s.hdr_active          ? "HDR10 on"
+                          : s.startup_hdr_output ? "SDR: the display offers no HDR10 (turn on HDR in Windows)"
+                                                 : "off");
+        ImGui::EndTable();
+    }
     ImGui::SeparatorText("Information");
     if (BeginRows("##image_info")) {
         char text[96];
@@ -566,7 +594,8 @@ void OverlayTab() {
 int RestartChanges() {
     const auto& s = VwSettings::Get();
     return (s.render_resolution != s.startup_render_resolution) + (s.aspect_ratio != s.startup_aspect_ratio) +
-           (s.text_language != s.startup_text_language) + (s.renderer != s.startup_renderer);
+           (s.text_language != s.startup_text_language) + (s.renderer != s.startup_renderer) +
+           (s.hdr_output != s.startup_hdr_output) + (s.hdr_output && s.hdr_float != s.startup_hdr_float);
 }
 
 void Menu() {
@@ -877,6 +906,20 @@ void Init(VkFormat format, u32 image_count) {
     style.FrameRounding = 4.0f;
     style.GrabRounding = 4.0f;
     style.Colors[ImGuiCol_WindowBg].w = 0.92f;
+    if (VwSettings::Get().hdr_active) {
+        // RenoDX HDR: the swapchain is PQ encoded, so the menu's sRGB colours are re-encoded to show
+        // at about SDR brightness (203 nits) instead of white text at the display's peak.
+        const auto pq = [](float srgb) {
+            const float linear = srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+            const float p = std::pow(std::clamp(linear * 203.0f / 10000.0f, 0.0f, 1.0f), 0.1593017578125f);
+            return std::pow((0.8359375f + 18.8515625f * p) / (1.0f + 18.6875f * p), 78.84375f);
+        };
+        for (ImVec4& c : style.Colors) {
+            c.x = pq(c.x);
+            c.y = pq(c.y);
+            c.z = pq(c.z);
+        }
+    }
 
     ImFontConfig font_config;
     font_config.FontDataOwnedByAtlas = false;

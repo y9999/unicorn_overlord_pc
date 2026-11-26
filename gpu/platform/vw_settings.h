@@ -54,13 +54,29 @@ struct Values {
     /// 0 native, 1 shadPS4: the game executable run.py starts (renderer=; bin/shadps4/ has the
     /// shadPS4 one). Switching needs a restart.
     std::atomic<int> renderer{0};
+    /// RenoDX HDR. Startup ("Apply and restart"): hdr_output makes the swapchain HDR10 (PQ,
+    /// BT.2020) when the display offers it; hdr_float (with hdr_output) renders the game into
+    /// 16-bit float targets so highlights above SDR white survive. Live: hdr_mode (0 vanilla:
+    /// the SDR image at game brightness, clipped at SDR white; 1 HDR: highlights rolled off to
+    /// the peak; 2 shows in magenta what lies above SDR white), the peak and game brightness in
+    /// nits, and the SDR decoding (gamma 2.2 like an SDR monitor, else the sRGB curve).
+    std::atomic<bool> hdr_output{false};
+    std::atomic<bool> hdr_float{true};
+    std::atomic<int> hdr_mode{1};
+    std::atomic<int> hdr_peak_nits{1000};
+    std::atomic<int> hdr_game_nits{203};
+    std::atomic<bool> hdr_gamma22{true};
+    /// Set by the presenter: the swapchain is HDR10 now.
+    std::atomic<bool> hdr_active{false};
     int startup_render_resolution = 0, startup_aspect_ratio = 0, startup_text_language = 0;
     int startup_renderer = 0;
+    bool startup_hdr_output = false, startup_hdr_float = false;
 };
 
 Values& Get();
 
 constexpr int StickDeadZoneMax = 40;
+constexpr int HdrPeakMin = 400, HdrPeakMax = 4000, HdrGameMin = 80, HdrGameMax = 500;
 
 /// Text settings: "key_map" and "pad_map" (button remapping, src/runtime_pad.c format).
 std::string Text(const std::string& key);

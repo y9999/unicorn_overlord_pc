@@ -98,6 +98,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.renderer = value == "shadps4" ? 1 : 0;
     } else if (key == "fps_limit") {
         v.fps_limit = VwGraphics::ParseFpsLimit(i);
+    } else if (key == "hdr_output") {
+        v.hdr_output = i != 0;
+    } else if (key == "hdr_float") {
+        v.hdr_float = i != 0;
+    } else if (key == "hdr_mode") {
+        v.hdr_mode = std::clamp(i, 0, 2);
+    } else if (key == "hdr_peak_nits") {
+        v.hdr_peak_nits = std::clamp(i, HdrPeakMin, HdrPeakMax);
+    } else if (key == "hdr_game_nits") {
+        v.hdr_game_nits = std::clamp(i, HdrGameMin, HdrGameMax);
+    } else if (key == "hdr_gamma22") {
+        v.hdr_gamma22 = i != 0;
     } else {
         std::scoped_lock lock{text_mutex};
         extras[key] = value;
@@ -146,6 +158,7 @@ void Load() {
     const std::pair<const char*, const char*> env_keys[] = {
         {"VW_FSR1", "fsr1"}, {"VW_ANIME4K", "anime4k"}, {"VW_RCAS", "rcas"},
         {"VW_STICK_DEAD_ZONE", "stick_dead_zone"}, {"VW_VSYNC", "vsync"},
+        {"VW_HDR", "hdr_output"}, {"VW_HDR_FLOAT", "hdr_float"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -156,12 +169,15 @@ void Load() {
     v.startup_aspect_ratio = v.aspect_ratio;
     v.startup_text_language = v.text_language;
     v.startup_renderer = v.renderer;
+    v.startup_hdr_output = v.hdr_output;
+    v.startup_hdr_float = v.hdr_float;
 }
 
 bool GraphicsNeedRestart() {
     const auto& v = Get();
     return v.render_resolution != v.startup_render_resolution || v.aspect_ratio != v.startup_aspect_ratio ||
-           v.text_language != v.startup_text_language || v.renderer != v.startup_renderer;
+           v.text_language != v.startup_text_language || v.renderer != v.startup_renderer ||
+           v.hdr_output != v.startup_hdr_output || (v.hdr_output && v.hdr_float != v.startup_hdr_float);
 }
 
 // Written beside vw.ini, then renamed over it: a crash or a suspend while writing kept an empty
@@ -208,6 +224,9 @@ void Save() {
                      .data(),
                  int(v.restart_unconfirmed.load()), v.stick_dead_zone.load());
     std::fprintf(file, "renderer=%s\n", v.renderer.load() == 1 ? "shadps4" : "native");
+    std::fprintf(file, "hdr_output=%d\nhdr_float=%d\nhdr_mode=%d\nhdr_peak_nits=%d\nhdr_game_nits=%d\nhdr_gamma22=%d\n",
+                 int(v.hdr_output.load()), int(v.hdr_float.load()), v.hdr_mode.load(), v.hdr_peak_nits.load(),
+                 v.hdr_game_nits.load(), int(v.hdr_gamma22.load()));
     {
         std::scoped_lock lock{text_mutex};
         for (const char* key : TextKeys) {
@@ -297,6 +316,11 @@ int IconIndex() {
 
 extern "C" int vwgpu_stick_dead_zone(void) {
     return VwSettings::Get().stick_dead_zone.load();
+}
+
+extern "C" int vwgpu_hdr_float_targets(void) {
+    const auto& v = VwSettings::Get();
+    return v.startup_hdr_output && v.startup_hdr_float ? 1 : 0;
 }
 
 extern "C" int vwgpu_setting_rows(const VwgpuSettingRow** rows) {

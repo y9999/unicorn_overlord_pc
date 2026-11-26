@@ -12,6 +12,12 @@ layout(set = 0, binding = 0) uniform sampler2D source;
 layout(push_constant) uniform Settings {
     uint srgb_input;
     float sharpen;   // 0 off .. 1 strongest
+    // RenoDX HDR (presenter.cpp PresentPass::Settings).
+    uint hdr_output; // 1: the frame is HDR10 (PQ, BT.2020)
+    uint hdr_mode;   // 0 vanilla SDR look, 1 HDR, 2 highlights above SDR white in magenta
+    float peak_nits;
+    float game_nits;
+    uint gamma22;    // SDR values decoded with gamma 2.2 (an SDR monitor) instead of the sRGB curve
 } settings;
 
 vec3 encode(vec3 c) {
@@ -20,10 +26,48 @@ vec3 encode(vec3 c) {
 vec3 decode(vec3 c) {
     return mix(pow(max(c + 0.055, 0.0) / 1.055, vec3(2.4)), c / 12.92, lessThan(c, vec3(0.04045)));
 }
+// Values above 1.0 (16-bit float targets) and below 0 keep their sign and follow the curve.
+vec3 decode_hdr(vec3 c) {
+    if (settings.gamma22 != 0u) return sign(c) * pow(abs(c), vec3(2.2));
+    return sign(c) * decode(abs(c));
+}
 vec4 tap(vec2 at) {
     vec4 c = texture(source, at);
-    if (settings.srgb_input != 0u) c.rgb = decode(c.rgb);
+    if (settings.srgb_input != 0u) c.rgb = settings.hdr_output != 0u ? decode_hdr(c.rgb) : decode(c.rgb);
     return c;
+}
+
+// ---- RenoDX HDR output ----
+// Above SDR white (1.0) the brightest channel rolls off smoothly towards the peak (the slope is 1
+// at SDR white, so nothing at or below it changes); hue is kept by scaling the three channels.
+vec3 roll_off(vec3 c, float peak) {
+    const float top = max(c.r, max(c.g, c.b));
+    if (top <= 1.0 || peak <= 1.0) return c;
+    const float room = peak - 1.0;
+    const float rolled = 1.0 + room * (1.0 - exp(-(top - 1.0) / room));
+    return c * (rolled / top);
+}
+vec3 bt709_to_bt2020(vec3 c) {
+    return vec3(dot(vec3(0.6274040, 0.3292820, 0.0433136), c),
+                dot(vec3(0.0690970, 0.9195400, 0.0113612), c),
+                dot(vec3(0.0163916, 0.0880132, 0.8955950), c));
+}
+vec3 pq_encode(vec3 nits) {
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    const vec3 p = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));
+}
+vec3 encode_hdr10(vec3 linear) {
+    if (any(isnan(linear)) || any(isinf(linear))) linear = vec3(0.0);
+    vec3 c = max(linear, 0.0);
+    if (settings.hdr_mode == 0u) {
+        c = min(c, 1.0);                                       // vanilla: clipped as on an SDR screen
+    } else if (settings.hdr_mode == 2u && max(c.r, max(c.g, c.b)) > 1.001) {
+        c = vec3(1.0, 0.0, 1.0);                               // proof: data above SDR white
+    } else {
+        c = roll_off(c, settings.peak_nits / settings.game_nits);
+    }
+    return pq_encode(bt709_to_bt2020(c) * settings.game_nits);
 }
 vec4 area(vec2 center, vec2 footprint, ivec2 taps) {
     vec4 sum = vec4(0.0);
@@ -50,10 +94,11 @@ void main() {
             const vec3 hi = max(m, max(max(n, s), max(w, e)));
             const vec3 amount = sqrt(clamp(min(lo, 1.0 - hi) / max(hi, 1e-4), 0.0, 1.0));
             const vec3 weight = amount * (-1.0 / mix(8.0, 5.0, settings.sharpen));
-            c.rgb = clamp((m + (n + s + w + e) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);
+            c.rgb = (m + (n + s + w + e) * weight) / (1.0 + 4.0 * weight);
+            c.rgb = settings.hdr_output != 0u ? max(c.rgb, 0.0) : clamp(c.rgb, 0.0, 1.0);
         }
     } else {
         c = tap(uv);
     }
-    color = vec4(encode(max(c.rgb, 0.0)), 1.0);
+    color = settings.hdr_output != 0u ? vec4(encode_hdr10(c.rgb), 1.0) : vec4(encode(max(c.rgb, 0.0)), 1.0);
 }
