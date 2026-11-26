@@ -86,7 +86,7 @@ enum {   /* opcodes */
     OpCompositeExtract = 81, OpSampledImage = 86, OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
     OpConvertSToF = 111, OpUConvert = 113, OpConvertUToPtr = 120, OpBitcast = 124, OpIAdd = 128, OpFAdd = 129,
     OpISub = 130, OpFSub = 131, OpIMul = 132, OpFMul = 133, OpFDiv = 136, OpLogicalOr = 166,
-    OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169, OpUGreaterThan = 172, OpSLessThan = 177,
+    OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169, OpINotEqual = 171, OpUGreaterThan = 172, OpSLessThan = 177,
     OpFOrdEqual = 180, OpFOrdNotEqual = 182, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186,
     OpFOrdLessThanEqual = 188, OpFOrdGreaterThanEqual = 190, OpShiftRightLogical = 194,
     OpShiftRightArithmetic = 195, OpShiftLeftLogical = 196, OpBitwiseAnd = 199, OpLoopMerge = 246,
@@ -498,7 +498,7 @@ static void image_sample(Ctx *c, const NsInst *n) {
     if (sm->slot != t->slot) { fail(c, "texture slot %u with sampler slot %u", t->slot, sm->slot); return; }
     if (n->unorm || n->da || n->r128 || n->tfe || n->lwe) { fail(c, "image_sample flags"); return; }
     const uint32_t word = slot_word(c, t->slot);
-    const uint32_t texture_index = emit2(c, &c->body, OpBitwiseAnd, c->t_u32, word, const_u32(c, 0xfffff));
+    const uint32_t texture_index = emit2(c, &c->body, OpBitwiseAnd, c->t_u32, word, const_u32(c, 0x7ffff));
     /* Bits 20..30: the sampler; bit 31 is the RenoDX HDR flag (see export). */
     const uint32_t sampler_index = emit2(c, &c->body, OpBitwiseAnd, c->t_u32,
                                          emit2(c, &c->body, OpShiftRightLogical, c->t_u32, word, const_u32(c, 20)),
@@ -513,9 +513,21 @@ static void image_sample(Ctx *c, const NsInst *n) {
     const uint32_t r = id(c);
     if (c->s->vertex) OP(&c->body, OpImageSampleExplicitLod, c->t_v4f32, r, sampled, uv, 2 /* Lod */, const_f32(c, 0.0f));
     else OP(&c->body, OpImageSampleImplicitLod, c->t_v4f32, r, sampled, uv);
+    /* RenoDX HDR: bit 19 of the slot word (src/native_vk.c) marks a 16-bit float render target.
+     * The game adds alpha onto alpha (blend one + one), which an RGBA8 UNORM target saturates at
+     * 1 but a float one lets grow, frame after frame where the target is never cleared; read back
+     * as a blend weight it overshot whole screens (tutorial background, battle map). Clamping the
+     * alpha the shader reads gives back the value the UNORM target held. */
+    const uint32_t is_float = emit2(c, &c->body, OpINotEqual, c->t_bool,
+                                    emit2(c, &c->body, OpBitwiseAnd, c->t_u32, word, const_u32(c, 1u << 19)), const_u32(c, 0));
     unsigned dst = n->vdata;
     for (unsigned k = 0; k < 4; ++k)
-        if (n->dmask >> k & 1) write_vgpr(c, dst++, bitcast(c, c->t_u32, emit2(c, &c->body, OpCompositeExtract, c->t_f32, r, k)));
+        if (n->dmask >> k & 1) {
+            uint32_t value = emit2(c, &c->body, OpCompositeExtract, c->t_f32, r, k);
+            if (k == 3) value = emit3(c, &c->body, OpSelect, c->t_f32, is_float,
+                                      ext3(c, c->t_f32, GlslFClamp, value, const_f32(c, 0.0f), const_f32(c, 1.0f)), value);
+            write_vgpr(c, dst++, bitcast(c, c->t_u32, value));
+        }
 }
 
 /* ---- Exports ---- */
@@ -551,7 +563,8 @@ static void export(Ctx *c, const NsInst *n) {
         /* Bit 31 of texture slot 0's word (src/native_vk.c): this draw may go above 1. */
         const uint32_t hdr = emit2(c, &c->body, OpUGreaterThan, c->t_bool, slot_word(c, 0), const_u32(c, 0x7fffffffu));
         const uint32_t top = emit3(c, &c->body, OpSelect, c->t_f32, hdr, const_f32(c, 65504.0f), const_f32(c, 1.0f));
-        for (int k = 0; k < 4; ++k) v[k] = ext3(c, c->t_f32, GlslFClamp, v[k], const_f32(c, 0.0f), top);
+        /* Alpha is a weight, never light: always 0..1. */
+        for (int k = 0; k < 4; ++k) v[k] = ext3(c, c->t_f32, GlslFClamp, v[k], const_f32(c, 0.0f), k == 3 ? const_f32(c, 1.0f) : top);
     }
     const uint32_t vec = id(c);
     OP(&c->body, OpCompositeConstruct, c->t_v4f32, vec, v[0], v[1], v[2], v[3]);

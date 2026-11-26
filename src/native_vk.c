@@ -33,7 +33,7 @@ static NativeProgram programs[MAX_PROGRAMS];
 static uint32_t program_count;
 static char shader_dir[1024];
 /* Bumped when the converter's output changes: old conversions are then redone. */
-#define CONVERTER_VERSION 6   /* 4: own translator (src/native_shader_spirv.c); 5-6: RenoDX HDR pixel colour clamp */
+#define CONVERTER_VERSION 7   /* 4: own translator (src/native_shader_spirv.c); 5-6: RenoDX HDR pixel colour clamp; 7: float-target alpha clamp */
 
 /* VW_NATIVE_SHADERS=<dir> uses converted shaders from there as they are; otherwise they live in
  * <user>/native_shaders, converted from the dump's eboot.bin when the stamp there does not
@@ -1190,8 +1190,12 @@ static void draw(const uint8_t *payload) {
     const uint32_t record_index = frame->record_count++;
     Record *record = (Record *)frame->records.mapped + record_index;
     for (int i = 0; i < TEXTURE_SLOTS; ++i)
-        record->slot[i] = (state.texture_index[i] == state.target->image.index ? dummy_texture.index : state.texture_index[i]) |
-                          state.sampler_index[i] << 20;
+    {
+        const uint32_t index = state.texture_index[i] == state.target->image.index ? dummy_texture.index : state.texture_index[i];
+        /* Bit 19: the texture is a 16-bit float render target, whose alpha the shader clamps to
+         * 0..1 when it samples it (src/native_shader_spirv.c). */
+        record->slot[i] = index | (image_is_float[index] ? 1u << 19 : 0u) | state.sampler_index[i] << 20;
+    }
     /* RenoDX HDR: pixel shaders clamp their colour to 0..1 like an UNORM target (the shader
      * translator), except when bit 31 of slot 0 lets it go above 1: for draws into a float target
      * that add light (blend destination factor one) or that read a float target (passes carrying
