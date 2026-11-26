@@ -539,6 +539,13 @@ static void export(Ctx *c, const NsInst *n) {
         for (int k = 0; k < 4; ++k)
             v[k] = (n->en >> k & 1) ? bitcast(c, c->t_f32, read_vgpr(c, regs[k])) : const_f32(c, k == 3 ? 1.0f : 0.0f);
     }
+    /* RenoDX HDR: a pixel shader's colour is clamped to 0..1 as an RGBA8 UNORM target stores it,
+     * so 16-bit float targets (src/native_vk.c) get the same values from every draw; only blending
+     * (light added onto light) can then go above SDR white. Without it, shaders whose outputs the
+     * UNORM clamp hid (negative or very large values) drew stripes and garbage into float targets.
+     * A no-op for RGBA8 targets, which clamp the same way. */
+    if (!c->s->vertex && n->target == 0)
+        for (int k = 0; k < 4; ++k) v[k] = ext3(c, c->t_f32, GlslFClamp, v[k], const_f32(c, 0.0f), const_f32(c, 1.0f));
     const uint32_t vec = id(c);
     OP(&c->body, OpCompositeConstruct, c->t_v4f32, vec, v[0], v[1], v[2], v[3]);
     if (c->s->vertex) {

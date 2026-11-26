@@ -33,7 +33,7 @@ static NativeProgram programs[MAX_PROGRAMS];
 static uint32_t program_count;
 static char shader_dir[1024];
 /* Bumped when the converter's output changes: old conversions are then redone. */
-#define CONVERTER_VERSION 4   /* 4: own translator (src/native_shader_spirv.c) */
+#define CONVERTER_VERSION 5   /* 4: own translator (src/native_shader_spirv.c); 5: pixel colour clamped to 0..1 (RenoDX HDR) */
 
 /* VW_NATIVE_SHADERS=<dir> uses converted shaders from there as they are; otherwise they live in
  * <user>/native_shaders, converted from the dump's eboot.bin when the stamp there does not
