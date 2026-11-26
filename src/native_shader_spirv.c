@@ -499,7 +499,10 @@ static void image_sample(Ctx *c, const NsInst *n) {
     if (n->unorm || n->da || n->r128 || n->tfe || n->lwe) { fail(c, "image_sample flags"); return; }
     const uint32_t word = slot_word(c, t->slot);
     const uint32_t texture_index = emit2(c, &c->body, OpBitwiseAnd, c->t_u32, word, const_u32(c, 0xfffff));
-    const uint32_t sampler_index = emit2(c, &c->body, OpShiftRightLogical, c->t_u32, word, const_u32(c, 20));
+    /* Bits 20..30: the sampler; bit 31 is the RenoDX HDR flag (see export). */
+    const uint32_t sampler_index = emit2(c, &c->body, OpBitwiseAnd, c->t_u32,
+                                         emit2(c, &c->body, OpShiftRightLogical, c->t_u32, word, const_u32(c, 20)),
+                                         const_u32(c, 0x7ff));
     const uint32_t texture = load(c, &c->body, c->t_image,
                                   emit2(c, &c->body, OpAccessChain, type_pointer(c, StorageUniformConstant, c->t_image), c->textures, texture_index));
     const uint32_t sampler = load(c, &c->body, c->t_sampler,
@@ -544,8 +547,12 @@ static void export(Ctx *c, const NsInst *n) {
      * (light added onto light) can then go above SDR white. Without it, shaders whose outputs the
      * UNORM clamp hid (negative or very large values) drew stripes and garbage into float targets.
      * A no-op for RGBA8 targets, which clamp the same way. */
-    if (!c->s->vertex && n->target == 0)
-        for (int k = 0; k < 4; ++k) v[k] = ext3(c, c->t_f32, GlslFClamp, v[k], const_f32(c, 0.0f), const_f32(c, 1.0f));
+    if (!c->s->vertex && n->target == 0) {
+        /* Bit 31 of texture slot 0's word (src/native_vk.c): this draw may go above 1. */
+        const uint32_t hdr = emit2(c, &c->body, OpUGreaterThan, c->t_bool, slot_word(c, 0), const_u32(c, 0x7fffffffu));
+        const uint32_t top = emit3(c, &c->body, OpSelect, c->t_f32, hdr, const_f32(c, 65504.0f), const_f32(c, 1.0f));
+        for (int k = 0; k < 4; ++k) v[k] = ext3(c, c->t_f32, GlslFClamp, v[k], const_f32(c, 0.0f), top);
+    }
     const uint32_t vec = id(c);
     OP(&c->body, OpCompositeConstruct, c->t_v4f32, vec, v[0], v[1], v[2], v[3]);
     if (c->s->vertex) {

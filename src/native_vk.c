@@ -33,7 +33,7 @@ static NativeProgram programs[MAX_PROGRAMS];
 static uint32_t program_count;
 static char shader_dir[1024];
 /* Bumped when the converter's output changes: old conversions are then redone. */
-#define CONVERTER_VERSION 5   /* 4: own translator (src/native_shader_spirv.c); 5: pixel colour clamped to 0..1 (RenoDX HDR) */
+#define CONVERTER_VERSION 6   /* 4: own translator (src/native_shader_spirv.c); 5-6: RenoDX HDR pixel colour clamp */
 
 /* VW_NATIVE_SHADERS=<dir> uses converted shaders from there as they are; otherwise they live in
  * <user>/native_shaders, converted from the dump's eboot.bin when the stamp there does not
@@ -217,6 +217,8 @@ static VkDescriptorSet bindless_set;
 static uint32_t image_count;
 /* Bindless indices of destroyed images, given to the next images made. */
 static uint32_t free_indices[MAX_IMAGES], free_index_count;
+/* RenoDX HDR: the bindless images that are 16-bit float render targets. */
+static uint8_t image_is_float[MAX_IMAGES];
 /* A frame being recorded or in flight: the GPU may still read its rings and staging buffers
  * until its fence signals. */
 typedef struct {
@@ -353,6 +355,7 @@ static Image image_create(uint32_t width, uint32_t height, VkFormat format, VkIm
             .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &info};
         vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
     }
+    image_is_float[image.index] = format == VK_FORMAT_R16G16B16A16_SFLOAT;
     return image;
 }
 /* The caller makes sure no submitted or recorded commands use the image any more. */
@@ -1141,6 +1144,18 @@ static void draw(const uint8_t *payload) {
     for (int i = 0; i < TEXTURE_SLOTS; ++i)
         record->slot[i] = (state.texture_index[i] == state.target->image.index ? dummy_texture.index : state.texture_index[i]) |
                           state.sampler_index[i] << 20;
+    /* RenoDX HDR: pixel shaders clamp their colour to 0..1 like an UNORM target (the shader
+     * translator), except when bit 31 of slot 0 lets it go above 1: for draws into a float target
+     * that add light (blend destination factor one) or that read a float target (passes carrying
+     * the scene's HDR on, up to the display buffer). The game's other draws wrote garbage above 1
+     * (battle map stripes). */
+    if (state.target->is_float) {
+        int hdr = ((state.blend >> 30) & 1) && ((state.blend >> 8) & 0x1f) == 1;
+        for (int i = 0; i < TEXTURE_SLOTS && !hdr; ++i)
+            hdr = state.texture_present[i] && state.texture_index[i] != state.target->image.index &&
+                  image_is_float[state.texture_index[i]];
+        if (hdr) record->slot[0] |= 0x80000000u;
+    }
     /* Every game constant slot of both stages: the shaders read theirs by slot. */
     for (int stage = 0; stage < 2; ++stage)
         for (int i = 0; i < GAME_SLOTS; ++i)
