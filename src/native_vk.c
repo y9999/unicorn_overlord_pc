@@ -1057,17 +1057,18 @@ static uint32_t stream_code(uint32_t format, uint32_t number) {
  * reads a float target carries the scene's HDR on and may; it also marks its target "post" for
  * this frame, and later draws into a post target that read no float target (the interface and
  * its overlays) stay clamped. Otherwise vw.ini decides, read at start:
- *   hdr_clamp=0  every other shader may go above 1;
- *   hdr_clamp=1  (default) additive draws (blend destination factor one) and hdr_allow_ps may;
+ *   hdr_clamp=0  (default) every other shader may go above 1;
+ *   hdr_clamp=1  additive draws (blend destination factor one) and hdr_allow_ps may;
  *   hdr_clamp=2  none may;
- *   hdr_allow_ps / hdr_deny_ps: hex hashes, comma separated; deny wins over everything. */
+ *   hdr_allow_ps / hdr_deny_ps: hex hashes, comma separated; deny wins over everything (default
+ *   deny list below when the key is absent). */
 #define HDR_LIST 64
 static uint32_t hdr_allow[HDR_LIST], hdr_deny[HDR_LIST], hdr_allow_n, hdr_deny_n;
 static int hdr_clamp_mode = -1;
-static void hdr_list_read(const char *key, uint32_t *list, uint32_t *n) {
+static void hdr_list_read(const char *key, const char *fallback, uint32_t *list, uint32_t *n) {
     char text[1024];
     *n = 0;
-    if (!vwgpu_setting_text(key, text, sizeof(text))) return;
+    if (!vwgpu_setting_text(key, text, sizeof(text))) snprintf(text, sizeof(text), "%s", fallback);
     for (char *at = text; *at && *n < HDR_LIST;) {
         char *end;
         const unsigned long v = strtoul(at, &end, 16);
@@ -1084,9 +1085,12 @@ static int hdr_in(const uint32_t *list, uint32_t n, uint32_t hash) {
 static int hdr_unclamped(uint32_t ps_hash) {
     if (hdr_clamp_mode < 0) {
         char text[16];
-        hdr_clamp_mode = vwgpu_setting_text("hdr_clamp", text, sizeof(text)) ? atoi(text) : 1;
-        hdr_list_read("hdr_allow_ps", hdr_allow, &hdr_allow_n);
-        hdr_list_read("hdr_deny_ps", hdr_deny, &hdr_deny_n);
+        /* Defaults found on the battle map, cutscenes and battles once float alpha is clamped
+         * (src/native_shader_spirv.c): every draw may go above 1, except a data target nothing
+         * reads (0f8c57f0) and two interface shaders (f0c1d191, f4a659e1). */
+        hdr_clamp_mode = vwgpu_setting_text("hdr_clamp", text, sizeof(text)) ? atoi(text) : 0;
+        hdr_list_read("hdr_allow_ps", "", hdr_allow, &hdr_allow_n);
+        hdr_list_read("hdr_deny_ps", "0f8c57f0,f0c1d191,f4a659e1", hdr_deny, &hdr_deny_n);
         printf("Native: HDR clamp mode %d\n", hdr_clamp_mode);
     }
     if (hdr_in(hdr_deny, hdr_deny_n, ps_hash)) return 0;
@@ -1630,7 +1634,8 @@ static void render_frame(NativeList *lists) {
     report = 0;
     /* RenoDX HDR diagnosis: when <data>/hdr_report.trigger exists, it is removed and this frame's
      * command lists go to <data>/logs/hdr_report_<frame>.txt with a table of the targets, and
-     * every target of 1280 pixels or wider is written as a PNG beside it (float ones clamped). */
+     * when the trigger file holds "png", every target of 1280 pixels or wider is written as a PNG
+     * beside it (float ones clamped). */
     {
         static char report_trigger[2048], report_dir[2048];
         if (!report_trigger[0]) {
@@ -1640,6 +1645,9 @@ static void render_frame(NativeList *lists) {
         }
         FILE *f = fopen(report_trigger, "r");
         if (f) {
+            /* The targets' PNGs (25 MB each at 4K, slow) only when the trigger file says "png". */
+            char want[16] = "";
+            const int pngs = fgets(want, sizeof(want), f) && strstr(want, "png");
             fclose(f);
             remove(report_trigger);
             CHECK(vkWaitForFences(device, 1, &frame->fence, VK_TRUE, UINT64_MAX));
@@ -1657,7 +1665,7 @@ static void render_frame(NativeList *lists) {
                 fclose(out);
             }
             for (uint32_t i = 0; i < target_count; ++i)
-                if (targets[i].address != ~0ull && targets[i].width >= 1280) shot_to(&targets[i], report_dir);
+                if (pngs && targets[i].address != ~0ull && targets[i].width >= 1280) shot_to(&targets[i], report_dir);
             printf("Native: HDR report written to %s\n", path);
             fflush(stdout);
         }
