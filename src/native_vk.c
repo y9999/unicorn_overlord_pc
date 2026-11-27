@@ -33,7 +33,7 @@ static NativeProgram programs[MAX_PROGRAMS];
 static uint32_t program_count;
 static char shader_dir[1024];
 /* Bumped when the converter's output changes: old conversions are then redone. */
-#define CONVERTER_VERSION 7   /* 4: own translator (src/native_shader_spirv.c); 5-6: RenoDX HDR pixel colour clamp; 7: float-target alpha clamp */
+#define CONVERTER_VERSION 8   /* 4: own translator (src/native_shader_spirv.c); 5-6: RenoDX HDR pixel colour clamp; 7: float-target alpha clamp */
 
 /* VW_NATIVE_SHADERS=<dir> uses converted shaders from there as they are; otherwise they live in
  * <user>/native_shaders, converted from the dump's eboot.bin when the stamp there does not
@@ -129,7 +129,9 @@ typedef struct {
 } Record;
 _Static_assert(sizeof(Record) == 544, "Record must match the layout src/native_shader_spirv.c reads");
 typedef struct { VkDeviceAddress records; } Push;
-typedef struct { uint64_t address; uint32_t width, height, swap, tiling; int is_float; uint64_t post_frame; Image image; } Target;
+/* is_float: RenoDX HDR 16-bit float image. post_frame: the frame in which a draw read a float target
+ * into it (the composed scene). ui: it is the interface target, copied to the display buffer. */
+typedef struct { uint64_t address; uint32_t width, height, swap, tiling; int is_float; uint64_t post_frame; int ui; Image image; } Target;
 /* source: the descriptor it was made from; span: the bytes of game memory it reads; hash: of
  * that memory when last uploaded (the game reuses memory for new content, see textures_check);
  * used: the last frame that drew with it or uploaded into it (see texture_slot). */
@@ -1206,6 +1208,21 @@ static void draw(const uint8_t *payload) {
      * the scene's HDR on, up to the display buffer). The game's other draws wrote garbage above 1
      * (battle map stripes). */
     if (state.target->is_float && hdr_unclamped(programs[ps].hash)) record->slot[0] |= 0x80000000u;
+    /* The target a draw copies into the display buffer is the interface target (sticky). */
+    if (state.target->tiling == 10)
+        for (int i = 0; i < TEXTURE_SLOTS; ++i)
+            if (state.texture_present[i] && image_is_float[state.texture_index[i]])
+                for (uint32_t t = 0; t < target_count; ++t)
+                    if (targets[t].image.index == state.texture_index[i]) targets[t].ui = 1;
+    /* RenoDX HDR: light the interface adds (blend destination factor one) onto the interface
+     * target, once the scene is composed into it. An RGBA8 target saturated the sum at 1; a float
+     * one lets it pass (gems, digits and stars brighter than the interface's white). A second
+     * draw of the same pixels with blend op min and the shader exporting 1 where the first one
+     * added light (65504 elsewhere, src/native_shader_spirv.c) gives back the saturation. */
+    const uint32_t b = state.blend;
+    const int saturate = state.target->is_float && state.target->ui && state.target->post_frame == frame_number &&
+                         ((b >> 30) & 1) && ((b >> 5) & 7) == 0 && ((b >> 8) & 0x1f) == 1 && (state.mask & 7) &&
+                         frame->record_count < MAX_RECORDS;
     /* Every game constant slot of both stages: the shaders read theirs by slot. */
     for (int stage = 0; stage < 2; ++stage)
         for (int i = 0; i < GAME_SLOTS; ++i)
@@ -1246,6 +1263,25 @@ static void draw(const uint8_t *payload) {
     if (!batch_count) batch_first = record_index;
     else if (batch_first + batch_count != record_index) { flush_draws(); batch_first = record_index; }
     ++batch_count;
+    if (saturate) {
+        const uint32_t second = frame->record_count++;
+        Record *clamp = (Record *)frame->records.mapped + second;
+        *clamp = *record;
+        clamp->slot[1] |= 0x80000000u;                                   /* export the min mask */
+        if ((b & 0x1f) == 4) clamp->slot[2] |= 0x80000000u;              /* source factor: alpha */
+        const uint32_t saved_blend = state.blend, saved_mask = state.mask;
+        state.blend = 1u << 30 | 2u << 5 | 1u << 8 | 1u;                   /* op min (factors ignored) */
+        state.mask = saved_mask & 7;                                       /* colour only */
+        const VkPipeline min_pipeline = pipeline_get(vs, ps, topology);
+        state.blend = saved_blend, state.mask = saved_mask;
+        flush_draws();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, min_pipeline);
+        emitted.pipeline = min_pipeline;
+        command = (VkDrawIndexedIndirectCommand *)frame->indirect.mapped + second;
+        *command = (VkDrawIndexedIndirectCommand){index_count, 1, (uint32_t)(index_at / 4), 0, second};
+        batch_first = second;
+        batch_count = 1;
+    }
     ++drawn_draws;
     if (WATCHED()) { ++watch_logged; printf("Native: watch frame %" PRIu64 " vs %08x ps %08x drawn, %u indices\n", frame_number, state.vs, state.ps, index_count); }
 }

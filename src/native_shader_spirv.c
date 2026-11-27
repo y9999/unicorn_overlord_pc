@@ -565,6 +565,18 @@ static void export(Ctx *c, const NsInst *n) {
         const uint32_t top = emit3(c, &c->body, OpSelect, c->t_f32, hdr, const_f32(c, 65504.0f), const_f32(c, 1.0f));
         /* Alpha is a weight, never light: always 0..1. */
         for (int k = 0; k < 4; ++k) v[k] = ext3(c, c->t_f32, GlslFClamp, v[k], const_f32(c, 0.0f), k == 3 ? const_f32(c, 1.0f) : top);
+        /* Bit 31 of slot 1: the interface saturation draw (src/native_vk.c, blend op min): 1 where
+         * this draw adds light (colour, times alpha when bit 31 of slot 2 says the source factor
+         * is alpha), 65504 (no change) elsewhere. */
+        const uint32_t mask = emit2(c, &c->body, OpUGreaterThan, c->t_bool, slot_word(c, 1), const_u32(c, 0x7fffffffu));
+        const uint32_t by_alpha = emit2(c, &c->body, OpUGreaterThan, c->t_bool, slot_word(c, 2), const_u32(c, 0x7fffffffu));
+        const uint32_t weight = emit3(c, &c->body, OpSelect, c->t_f32, by_alpha, v[3], const_f32(c, 1.0f));
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t adds = emit2(c, &c->body, OpFOrdGreaterThan, c->t_bool,
+                                        emit2(c, &c->body, OpFMul, c->t_f32, v[k], weight), const_f32(c, 0.0f));
+            const uint32_t limit = emit3(c, &c->body, OpSelect, c->t_f32, adds, const_f32(c, 1.0f), const_f32(c, 65504.0f));
+            v[k] = emit3(c, &c->body, OpSelect, c->t_f32, mask, limit, v[k]);
+        }
     }
     const uint32_t vec = id(c);
     OP(&c->body, OpCompositeConstruct, c->t_v4f32, vec, v[0], v[1], v[2], v[3]);
